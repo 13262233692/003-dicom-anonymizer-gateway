@@ -1,0 +1,31 @@
+import { OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { ConfigType } from '@nestjs/config';
+import configuration from '@common/config/configuration';
+import { DicomPduCodec } from './dicom-pdu-codec.service';
+import { DimseCodec } from './dimse-codec.service';
+import { DicomAssociation, CStoreRequest } from './dicom-pdu.types';
+import { Observable } from 'rxjs';
+export declare class DicomScpServer implements OnModuleInit, OnModuleDestroy {
+    private readonly config;
+    private readonly pduCodec;
+    private readonly dimseCodec;
+    private readonly logger;
+    private server;
+    private readonly associations;
+    private readonly cStoreRequestSubject;
+    constructor(config: ConfigType<typeof configuration>, pduCodec: DicomPduCodec, dimseCodec: DimseCodec);
+    get cStoreRequests$(): Observable<CStoreRequest>;
+    onModuleInit(): void;
+    onModuleDestroy(): void;
+    private startServer;
+    private stopServer;
+    private handleConnection;
+    private handleAssociateRq;
+    private selectTransferSyntax;
+    private handleDimseCommand;
+    private sendCStoreResponse;
+    private sendCEchoResponse;
+    private handleReleaseRq;
+    private handleAbort;
+    getActiveAssociations(): DicomAssociation[];
+}
