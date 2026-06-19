@@ -1,0 +1,34 @@
+import { OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { ConfigType } from '@nestjs/config';
+import { Observable } from 'rxjs';
+import configuration from '@common/config/configuration';
+import { Hl7ParserService } from './hl7-parser.service';
+import { Hl7Message, Hl7Event } from '@common/types/hl7.types';
+export declare class MllpServerService implements OnModuleInit, OnModuleDestroy {
+    private readonly config;
+    private readonly hl7Parser;
+    private readonly logger;
+    private server;
+    private readonly connections;
+    private readonly messageSubject;
+    private readonly eventSubject;
+    constructor(config: ConfigType<typeof configuration>, hl7Parser: Hl7ParserService);
+    onModuleInit(): void;
+    onModuleDestroy(): void;
+    get messages$(): Observable<Hl7Message>;
+    get events$(): Observable<Hl7Event>;
+    private startServer;
+    private stopServer;
+    private handleConnection;
+    private extractMllpMessages;
+    private handleRawMessage;
+    private sendAcknowledgment;
+    private sendErrorAcknowledgment;
+    private buildAckMessage;
+    private sendMllpMessage;
+    private formatHl7DateTime;
+    private generateMessageControlId;
+    private generateConnectionId;
+    getConnectionCount(): number;
+    isListening(): boolean;
+}

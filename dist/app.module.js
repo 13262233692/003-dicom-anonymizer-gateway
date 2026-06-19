@@ -17,6 +17,7 @@ const redis_rule_service_1 = require("./redis/redis-rule.service");
 const anonymization_module_1 = require("./anonymization/anonymization.module");
 const routing_module_1 = require("./routing/routing.module");
 const audit_module_1 = require("./audit/audit.module");
+const hl7_module_1 = require("./hl7/hl7.module");
 const gateway_coordinator_service_1 = require("./gateway-coordinator.service");
 const health_controller_1 = require("./health.controller");
 let AppModule = class AppModule {
@@ -32,6 +33,7 @@ exports.AppModule = AppModule = __decorate([
             anonymization_module_1.AnonymizationModule,
             routing_module_1.RoutingModule,
             audit_module_1.AuditModule,
+            hl7_module_1.Hl7Module,
             terminus_1.TerminusModule,
         ],
         controllers: [health_controller_1.HealthController],

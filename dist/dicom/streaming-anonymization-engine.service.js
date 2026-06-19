@@ -5,6 +5,9 @@ var __decorate = (this && this.__decorate) || function (decorators, target, key,
     else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
     return c > 3 && r && Object.defineProperty(target, key, r), r;
 };
+var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
 var StreamingAnonymizationEngine_1;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.StreamingAnonymizationEngine = void 0;
@@ -12,14 +15,21 @@ const common_1 = require("@nestjs/common");
 const uuid_1 = require("uuid");
 const dicom_anonymization_stream_1 = require("./dicom-anonymization-stream");
 const dicom_stream_parser_1 = require("./dicom-stream-parser");
+const anonymization_rule_enhancer_service_1 = require("./anonymization-rule-enhancer.service");
 let StreamingAnonymizationEngine = StreamingAnonymizationEngine_1 = class StreamingAnonymizationEngine {
-    constructor() {
+    constructor(ruleEnhancer) {
+        this.ruleEnhancer = ruleEnhancer;
         this.logger = new common_1.Logger(StreamingAnonymizationEngine_1.name);
     }
-    createAnonymizationStream(rule, hospitalId, sourceAeTitle) {
+    createAnonymizationStream(rule, hospitalId, sourceAeTitle, patientState) {
         const traceId = (0, uuid_1.v4)();
-        this.logger.log(`[${traceId}] Creating streaming anonymization pipeline for hospital ${hospitalId}, source AE: ${sourceAeTitle}`);
-        const stream = new dicom_anonymization_stream_1.DicomAnonymizationStream(rule.tagRules, {
+        const effectiveTagRules = patientState
+            ? this.ruleEnhancer.enhanceRuleForPatient(rule, patientState)
+            : rule.tagRules;
+        this.logger.log(`[${traceId}] Creating streaming anonymization pipeline for hospital ${hospitalId}, source AE: ${sourceAeTitle}, ` +
+            `patient sensitivity: ${patientState?.sensitivityLevel || 'normal'}, ` +
+            `effective rules: ${effectiveTagRules.length}`);
+        const stream = new dicom_anonymization_stream_1.DicomAnonymizationStream(effectiveTagRules, {
             traceId,
             hospitalId,
         });
@@ -67,10 +77,11 @@ let StreamingAnonymizationEngine = StreamingAnonymizationEngine_1 = class Stream
             stream,
             resultPromise,
             traceId,
+            effectiveTagRules,
         };
     }
-    async processBuffer(buffer, rule, hospitalId, sourceAeTitle) {
-        const { stream, resultPromise, traceId } = this.createAnonymizationStream(rule, hospitalId, sourceAeTitle);
+    async processBuffer(buffer, rule, hospitalId, sourceAeTitle, patientState) {
+        const { stream, resultPromise, traceId } = this.createAnonymizationStream(rule, hospitalId, sourceAeTitle, patientState);
         const startTime = Date.now();
         const chunks = [];
         stream.on('data', (chunk) => {
@@ -146,6 +157,7 @@ let StreamingAnonymizationEngine = StreamingAnonymizationEngine_1 = class Stream
 };
 exports.StreamingAnonymizationEngine = StreamingAnonymizationEngine;
 exports.StreamingAnonymizationEngine = StreamingAnonymizationEngine = StreamingAnonymizationEngine_1 = __decorate([
-    (0, common_1.Injectable)()
+    (0, common_1.Injectable)(),
+    __metadata("design:paramtypes", [anonymization_rule_enhancer_service_1.AnonymizationRuleEnhancer])
 ], StreamingAnonymizationEngine);
 //# sourceMappingURL=streaming-anonymization-engine.service.js.map

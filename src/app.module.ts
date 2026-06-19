@@ -8,6 +8,7 @@ import { RedisRuleService } from './redis/redis-rule.service';
 import { AnonymizationModule } from './anonymization/anonymization.module';
 import { RoutingModule } from './routing/routing.module';
 import { AuditModule } from './audit/audit.module';
+import { Hl7Module } from './hl7/hl7.module';
 import { GatewayCoordinator } from './gateway-coordinator.service';
 import { HealthController } from './health.controller';
 
@@ -20,6 +21,7 @@ import { HealthController } from './health.controller';
     AnonymizationModule,
     RoutingModule,
     AuditModule,
+    Hl7Module,
     TerminusModule,
   ],
   controllers: [HealthController],

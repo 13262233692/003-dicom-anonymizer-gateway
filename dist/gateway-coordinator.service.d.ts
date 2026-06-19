@@ -6,6 +6,8 @@ import { StreamingAnonymizationEngine } from '@dicom/streaming-anonymization-eng
 import { RedisRuleService } from '@redis/redis-rule.service';
 import { RoutingEngine } from '@routing/routing-engine.service';
 import { AuditLoggerService } from '@audit/audit-logger.service';
+import { PatientStateService } from '@hl7/patient-state.service';
+import { MllpServerService } from '@hl7/mllp-server.service';
 export declare class GatewayCoordinator implements OnModuleInit {
     private readonly dicomScpServer;
     private readonly dicomParser;
@@ -14,9 +16,15 @@ export declare class GatewayCoordinator implements OnModuleInit {
     private readonly redisRuleService;
     private readonly routingEngine;
     private readonly auditLogger;
+    private readonly patientStateService;
+    private readonly mllpServer;
     private readonly logger;
-    constructor(dicomScpServer: DicomScpServer, dicomParser: DicomBinaryParser, anonymizationEngine: AnonymizationEngine, streamingAnonymizationEngine: StreamingAnonymizationEngine, redisRuleService: RedisRuleService, routingEngine: RoutingEngine, auditLogger: AuditLoggerService);
+    private readonly MAX_PREBUFFER_SIZE;
+    constructor(dicomScpServer: DicomScpServer, dicomParser: DicomBinaryParser, anonymizationEngine: AnonymizationEngine, streamingAnonymizationEngine: StreamingAnonymizationEngine, redisRuleService: RedisRuleService, routingEngine: RoutingEngine, auditLogger: AuditLoggerService, patientStateService: PatientStateService, mllpServer: MllpServerService);
     onModuleInit(): void;
+    private handleHl7Message;
     private handleCStoreStreamRequest;
+    private createSmartAnonymizationStream;
+    private setupEnhancedStream;
     private resolveHospitalId;
 }

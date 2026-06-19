@@ -7,6 +7,12 @@ export declare enum AnonymizationActionType {
     KEEP = "keep",
     EMPTY = "empty"
 }
+export declare enum SensitivityLevel {
+    NORMAL = "normal",
+    HIGH = "high",
+    VERY_HIGH = "very_high",
+    MAXIMUM = "maximum"
+}
 export interface AnonymizationRule {
     id: string;
     hospitalId: string;
@@ -17,6 +23,7 @@ export interface AnonymizationRule {
     priority: number;
     createdAt: string;
     updatedAt: string;
+    baseSensitivityLevel?: SensitivityLevel;
 }
 export interface TagRule {
     tagKey: string;

@@ -4,15 +4,76 @@ import { CStoreStreamRequest, DimseStatus } from '@protocol/dicom-pdu.types';
 import { DicomBinaryParser } from '@dicom/dicom-binary-parser.service';
 import { AnonymizationEngine } from '@anonymization/anonymization-engine.service';
 import { StreamingAnonymizationEngine } from '@dicom/streaming-anonymization-engine.service';
+import { DicomStreamParser } from '@dicom/dicom-stream-parser';
 import { RedisRuleService } from '@redis/redis-rule.service';
 import { RoutingEngine } from '@routing/routing-engine.service';
 import { AuditLoggerService } from '@audit/audit-logger.service';
-import { AuditEventType } from '@common/types/anonymization.types';
+import { PatientStateService } from '@hl7/patient-state.service';
+import { MllpServerService } from '@hl7/mllp-server.service';
+import { AuditEventType, AnonymizationRule, TagRule } from '@common/types/anonymization.types';
 import { v4 as uuidv4 } from 'uuid';
+import { PatientState, Hl7Message } from '@common/types/hl7.types';
+import { Readable, PassThrough, Transform } from 'stream';
+
+class BufferedReplayStream extends Readable {
+  private bufferIndex = 0;
+  private sourceEnded = false;
+  private sourceFlowing = false;
+
+  constructor(
+    private readonly preBuffer: Buffer[],
+    private readonly source: Readable,
+  ) {
+    super();
+  }
+
+  _read(): void {
+    if (this.bufferIndex < this.preBuffer.length) {
+      const chunk = this.preBuffer[this.bufferIndex++];
+      this.push(chunk);
+      return;
+    }
+
+    if (this.sourceEnded) {
+      this.push(null);
+      return;
+    }
+
+    if (!this.sourceFlowing) {
+      this.sourceFlowing = true;
+      this.setupSourceListeners();
+    }
+
+    let chunk;
+    while ((chunk = this.source.read()) !== null) {
+      if (!this.push(chunk)) {
+        return;
+      }
+    }
+  }
+
+  private setupSourceListeners(): void {
+    this.source.on('end', () => {
+      this.sourceEnded = true;
+      if (this.bufferIndex >= this.preBuffer.length) {
+        this.push(null);
+      }
+    });
+
+    this.source.on('error', (error) => {
+      this.destroy(error);
+    });
+
+    this.source.on('readable', () => {
+      this._read();
+    });
+  }
+}
 
 @Injectable()
 export class GatewayCoordinator implements OnModuleInit {
   private readonly logger = new Logger(GatewayCoordinator.name);
+  private readonly MAX_PREBUFFER_SIZE = 64 * 1024 * 1024;
 
   constructor(
     private readonly dicomScpServer: DicomScpServer,
@@ -22,6 +83,8 @@ export class GatewayCoordinator implements OnModuleInit {
     private readonly redisRuleService: RedisRuleService,
     private readonly routingEngine: RoutingEngine,
     private readonly auditLogger: AuditLoggerService,
+    private readonly patientStateService: PatientStateService,
+    private readonly mllpServer: MllpServerService,
   ) {}
 
   onModuleInit(): void {
@@ -42,11 +105,75 @@ export class GatewayCoordinator implements OnModuleInit {
       },
     });
 
+    this.logger.log('Gateway Coordinator initializing HL7 message subscription');
+    this.mllpServer.messages$.subscribe({
+      next: (message) => {
+        this.handleHl7Message(message).catch((error) => {
+          this.logger.error(`Unhandled error in HL7 message processing: ${error.message}`);
+        });
+      },
+      error: (error) => {
+        this.logger.error(`HL7 message stream error: ${error.message}`);
+      },
+    });
+
     const memInfo = this.streamingAnonymizationEngine.getMemoryUsageInfo();
     this.logger.log(
       `Streaming pipeline configured: maxTagValueInMemory=${memInfo.maxTagValueInMemory}, ` +
         `expectedMemoryPerStream=${memInfo.expectedMemoryPerStream}`,
     );
+
+    this.logger.log(
+      `MLLP server status: listening=${this.mllpServer.isListening()}, ` +
+        `connections=${this.mllpServer.getConnectionCount()}`,
+    );
+  }
+
+  private async handleHl7Message(message: Hl7Message): Promise<void> {
+    const traceId = uuidv4();
+
+    try {
+      const patientState = await this.patientStateService.processHl7Message(message);
+
+      this.logger.log(
+        `[${traceId}] HL7 message processed: type=${message.messageTypeFull}, ` +
+          `patientId=${message.pid.patientId}, ` +
+          `status=${patientState.patientAccountStatus}, ` +
+          `sensitivity=${patientState.sensitivityLevel}`,
+      );
+
+      await this.auditLogger.log({
+        eventType: AuditEventType.ANONYMIZATION_STARTED,
+        traceId,
+        hospitalId: (message as any).hospitalId,
+        patientId: message.pid.patientId,
+        status: 'success',
+        additionalData: {
+          hl7MessageType: message.messageTypeFull,
+          messageControlId: message.messageControlId,
+          patientAccountStatus: patientState.patientAccountStatus,
+          sensitivityLevel: patientState.sensitivityLevel,
+          source: 'hl7_mllp',
+        },
+      });
+    } catch (error) {
+      this.logger.error(
+        `[${traceId}] Failed to process HL7 message: ${error.message}`,
+      );
+
+      await this.auditLogger.log({
+        eventType: AuditEventType.ERROR_OCCURRED,
+        traceId,
+        patientId: message.pid?.patientId,
+        status: 'failed',
+        errorMessage: error.message,
+        errorStack: error.stack,
+        additionalData: {
+          hl7MessageType: message.messageTypeFull,
+          source: 'hl7_mllp',
+        },
+      });
+    }
   }
 
   private async handleCStoreStreamRequest(request: CStoreStreamRequest): Promise<void> {
@@ -87,38 +214,24 @@ export class GatewayCoordinator implements OnModuleInit {
     try {
       this.logger.debug(`[${traceId}] Resolved hospital ID: ${hospitalId} (from AE Title)`);
 
-      await this.auditLogger.log({
-        eventType: AuditEventType.ANONYMIZATION_STARTED,
-        traceId,
-        hospitalId,
-        sourceAeTitle: request.association.callingAeTitle,
-        sopClassUid: request.command.sopClassUid,
-        sopInstanceUid: request.command.sopInstanceUid,
-        status: 'processing',
-        additionalData: {
-          processingMode: 'streaming-end-to-end',
-        },
-      });
-
       const anonymizationRule = await this.redisRuleService.getAnonymizationRule(hospitalId);
 
-      const {
-        stream: anonymizationStream,
-        resultPromise: streamResultPromise,
-      } = this.streamingAnonymizationEngine.createAnonymizationStream(
-        anonymizationRule,
-        hospitalId,
-        request.association.callingAeTitle,
-      );
-
-      request.dataSetStream.pipe(anonymizationStream);
+      const { outputStream, streamResultPromise, patientState, sensitivityLevel } =
+        await this.createSmartAnonymizationStream(
+          request.dataSetStream,
+          anonymizationRule,
+          hospitalId,
+          request.association.callingAeTitle,
+          traceId,
+        );
 
       const streamResult = await streamResultPromise;
 
       this.logger.debug(
         `[${traceId}] Stream metadata ready: modified=${streamResult.modifiedTags.length}, ` +
           `removed=${streamResult.removedTags.length}, ` +
-          `pixelData=${(streamResult.pixelDataBytesProcessed / 1024 / 1024).toFixed(2)}MB`,
+          `pixelData=${(streamResult.pixelDataBytesProcessed / 1024 / 1024).toFixed(2)}MB, ` +
+          `sensitivity=${sensitivityLevel}`,
       );
 
       await this.auditLogger.log({
@@ -142,6 +255,8 @@ export class GatewayCoordinator implements OnModuleInit {
           processingMode: 'streaming-end-to-end',
           pixelDataBytesProcessed: streamResult.pixelDataBytesProcessed,
           totalTagsProcessed: streamResult.totalTagsProcessed,
+          patientSensitivityLevel: sensitivityLevel,
+          patientAccountStatus: patientState?.patientAccountStatus,
         },
       });
 
@@ -177,7 +292,7 @@ export class GatewayCoordinator implements OnModuleInit {
       });
 
       const transferResult = await this.routingEngine.forwardStreamToPacs(
-        anonymizationStream,
+        outputStream,
         streamResult,
         routingTarget,
         request.association.calledAeTitle,
@@ -208,6 +323,7 @@ export class GatewayCoordinator implements OnModuleInit {
             dicomStatus: transferResult.status,
             processingMode: 'streaming-end-to-end',
             pixelDataBytes: streamResult.pixelDataBytesProcessed,
+            patientSensitivityLevel: sensitivityLevel,
           },
         });
 
@@ -216,7 +332,8 @@ export class GatewayCoordinator implements OnModuleInit {
             `Total duration: ${totalDuration}ms, ` +
             `Pixel data: ${(streamResult.pixelDataBytesProcessed / 1024 / 1024).toFixed(2)}MB, ` +
             `Tags modified: ${streamResult.modifiedTags.length}, ` +
-            `Tags removed: ${streamResult.removedTags.length}`,
+            `Tags removed: ${streamResult.removedTags.length}, ` +
+            `Sensitivity: ${sensitivityLevel}`,
         );
       } else {
         respondWithStatus(transferResult.status);
@@ -235,6 +352,7 @@ export class GatewayCoordinator implements OnModuleInit {
           additionalData: {
             totalDurationMs: totalDuration,
             processingMode: 'streaming-end-to-end',
+            patientSensitivityLevel: sensitivityLevel,
           },
         });
 
@@ -269,6 +387,176 @@ export class GatewayCoordinator implements OnModuleInit {
         },
       });
     }
+  }
+
+  private createSmartAnonymizationStream(
+    sourceStream: Readable,
+    baseRule: AnonymizationRule,
+    hospitalId: string,
+    sourceAeTitle: string,
+    traceId: string,
+  ): Promise<{
+    outputStream: Readable;
+    streamResultPromise: Promise<any>;
+    patientState: PatientState | null;
+    sensitivityLevel: string;
+  }> {
+    return new Promise((resolve, reject) => {
+      const preBuffer: Buffer[] = [];
+      let preBufferSize = 0;
+      let patientId: string | null = null;
+      let metadataReady = false;
+      let errorOccurred = false;
+
+      const preParser = new DicomStreamParser();
+
+      preParser.on('tag', (event) => {
+        if (event.group === 0x0010 && event.element === 0x0020 && event.value) {
+          patientId = String(event.value).trim().replace(/\0/g, '');
+          this.logger.debug(`[${traceId}] Found patient ID in stream: ${patientId}`);
+        }
+      });
+
+      const finalize = async () => {
+        if (metadataReady || errorOccurred) return;
+        metadataReady = true;
+
+        try {
+          const result = await this.setupEnhancedStream(
+            preBuffer,
+            sourceStream,
+            baseRule,
+            hospitalId,
+            sourceAeTitle,
+            traceId,
+            patientId,
+          );
+          resolve(result);
+        } catch (error) {
+          errorOccurred = true;
+          reject(error);
+        }
+      };
+
+      preParser.on('pixelDataStart', () => {
+        this.logger.debug(`[${traceId}] Pixel data start detected, switching to enhanced stream`);
+        finalize();
+      });
+
+      preParser.on('parseComplete', () => {
+        this.logger.debug(`[${traceId}] Parse complete (no pixel data), finalizing stream`);
+        finalize();
+      });
+
+      preParser.on('error', (error) => {
+        if (!errorOccurred) {
+          errorOccurred = true;
+          this.logger.error(`[${traceId}] Pre-parser error: ${error.message}`);
+          reject(error);
+        }
+      });
+
+      sourceStream.on('readable', () => {
+        if (metadataReady || errorOccurred) return;
+
+        let chunk;
+        while ((chunk = sourceStream.read()) !== null) {
+          if (metadataReady || errorOccurred) {
+            sourceStream.unshift(chunk);
+            break;
+          }
+
+          preBuffer.push(chunk);
+          preBufferSize += chunk.length;
+
+          try {
+            preParser.write(chunk);
+          } catch (error) {
+            if (!errorOccurred) {
+              errorOccurred = true;
+              reject(error);
+            }
+            return;
+          }
+
+          if (preBufferSize > this.MAX_PREBUFFER_SIZE) {
+            this.logger.warn(
+              `[${traceId}] Pre-buffer exceeded max size (${this.MAX_PREBUFFER_SIZE} bytes), ` +
+                `falling back to base rules`,
+            );
+            finalize();
+            break;
+          }
+        }
+      });
+
+      sourceStream.on('end', () => {
+        if (!metadataReady && !errorOccurred) {
+          preParser.end();
+          finalize();
+        }
+      });
+
+      sourceStream.on('error', (error) => {
+        if (!errorOccurred) {
+          errorOccurred = true;
+          reject(error);
+        }
+      });
+    });
+  }
+
+  private async setupEnhancedStream(
+    preBuffer: Buffer[],
+    sourceStream: Readable,
+    baseRule: AnonymizationRule,
+    hospitalId: string,
+    sourceAeTitle: string,
+    traceId: string,
+    patientId: string | null,
+  ): Promise<{
+    outputStream: Readable;
+    streamResultPromise: Promise<any>;
+    patientState: PatientState | null;
+    sensitivityLevel: string;
+  }> {
+    let patientState: PatientState | null = null;
+    let sensitivityLevel = 'normal';
+
+    if (patientId) {
+      patientState = await this.patientStateService.getPatientState(patientId, hospitalId);
+      if (patientState) {
+        sensitivityLevel = patientState.sensitivityLevel || 'normal';
+        this.logger.debug(
+          `[${traceId}] Patient state loaded: sensitivity=${sensitivityLevel}, ` +
+            `status=${patientState.patientAccountStatus}`,
+        );
+      } else {
+        this.logger.debug(
+          `[${traceId}] No patient state found for ${patientId}, using base rules`,
+        );
+      }
+    }
+
+    const {
+      stream: anonymizationStream,
+      resultPromise: streamResultPromise,
+    } = this.streamingAnonymizationEngine.createAnonymizationStream(
+      baseRule,
+      hospitalId,
+      sourceAeTitle,
+      patientState,
+    );
+
+    const replayStream = new BufferedReplayStream(preBuffer, sourceStream);
+    replayStream.pipe(anonymizationStream);
+
+    return {
+      outputStream: anonymizationStream,
+      streamResultPromise,
+      patientState,
+      sensitivityLevel,
+    };
   }
 
   private resolveHospitalId(callingAeTitle: string): string {

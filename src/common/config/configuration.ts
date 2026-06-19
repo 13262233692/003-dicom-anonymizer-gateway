@@ -34,6 +34,15 @@ export interface PacsTargetConfig {
   aeTitle: string;
 }
 
+export interface Hl7MllpConfig {
+  port: number;
+  host: string;
+  maxConnections: number;
+  connectionTimeout: number;
+  autoAcknowledge: boolean;
+  defaultHospitalId: string;
+}
+
 export interface AppConfig {
   nodeEnv: string;
   port: number;
@@ -42,6 +51,7 @@ export interface AppConfig {
   redis: RedisConfig;
   kafka: KafkaConfig;
   defaultPacs: PacsTargetConfig;
+  hl7: Hl7MllpConfig;
 }
 
 export default registerAs(
@@ -79,6 +89,14 @@ export default registerAs(
       host: process.env.PACS_DEFAULT_HOST || 'localhost',
       port: parseInt(process.env.PACS_DEFAULT_PORT || '11113', 10),
       aeTitle: process.env.PACS_DEFAULT_AET || 'PACS_SERVER',
+    },
+    hl7: {
+      port: parseInt(process.env.HL7_MLLP_PORT || '2575', 10),
+      host: process.env.HL7_MLLP_HOST || '0.0.0.0',
+      maxConnections: parseInt(process.env.HL7_MAX_CONNECTIONS || '50', 10),
+      connectionTimeout: parseInt(process.env.HL7_CONNECTION_TIMEOUT || '30000', 10),
+      autoAcknowledge: process.env.HL7_AUTO_ACK !== 'false',
+      defaultHospitalId: process.env.HL7_DEFAULT_HOSPITAL_ID || 'default',
     },
   }),
 );

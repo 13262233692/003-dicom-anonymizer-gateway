@@ -1,10 +1,12 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { Readable } from 'stream';
 import { v4 as uuidv4 } from 'uuid';
-import { AnonymizationRule, ProcessingResult } from '@common/types/anonymization.types';
+import { AnonymizationRule, ProcessingResult, TagRule } from '@common/types/anonymization.types';
 import { DicomAnonymizationStream, AnonymizationStreamResult } from './dicom-anonymization-stream';
 import { DicomStreamParser } from './dicom-stream-parser';
 import { DicomTag } from '@common/types/dicom.types';
+import { PatientState } from '@common/types/hl7.types';
+import { AnonymizationRuleEnhancer } from './anonymization-rule-enhancer.service';
 
 export interface StreamingProcessResult {
   traceId: string;
@@ -19,22 +21,34 @@ export interface StreamingProcessResult {
 export class StreamingAnonymizationEngine {
   private readonly logger = new Logger(StreamingAnonymizationEngine.name);
 
+  constructor(
+    private readonly ruleEnhancer: AnonymizationRuleEnhancer,
+  ) {}
+
   public createAnonymizationStream(
     rule: AnonymizationRule,
     hospitalId: string,
     sourceAeTitle: string,
+    patientState?: PatientState | null,
   ): {
     stream: DicomAnonymizationStream;
     resultPromise: Promise<AnonymizationStreamResult>;
     traceId: string;
+    effectiveTagRules: TagRule[];
   } {
     const traceId = uuidv4();
 
+    const effectiveTagRules = patientState
+      ? this.ruleEnhancer.enhanceRuleForPatient(rule, patientState)
+      : rule.tagRules;
+
     this.logger.log(
-      `[${traceId}] Creating streaming anonymization pipeline for hospital ${hospitalId}, source AE: ${sourceAeTitle}`,
+      `[${traceId}] Creating streaming anonymization pipeline for hospital ${hospitalId}, source AE: ${sourceAeTitle}, ` +
+        `patient sensitivity: ${patientState?.sensitivityLevel || 'normal'}, ` +
+        `effective rules: ${effectiveTagRules.length}`,
     );
 
-    const stream = new DicomAnonymizationStream(rule.tagRules, {
+    const stream = new DicomAnonymizationStream(effectiveTagRules, {
       traceId,
       hospitalId,
     });
@@ -89,6 +103,7 @@ export class StreamingAnonymizationEngine {
       stream,
       resultPromise,
       traceId,
+      effectiveTagRules,
     };
   }
 
@@ -97,11 +112,13 @@ export class StreamingAnonymizationEngine {
     rule: AnonymizationRule,
     hospitalId: string,
     sourceAeTitle: string,
+    patientState?: PatientState | null,
   ): Promise<ProcessingResult> {
     const { stream, resultPromise, traceId } = this.createAnonymizationStream(
       rule,
       hospitalId,
       sourceAeTitle,
+      patientState,
     );
 
     const startTime = Date.now();

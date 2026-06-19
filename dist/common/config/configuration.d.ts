@@ -28,6 +28,14 @@ export interface PacsTargetConfig {
     port: number;
     aeTitle: string;
 }
+export interface Hl7MllpConfig {
+    port: number;
+    host: string;
+    maxConnections: number;
+    connectionTimeout: number;
+    autoAcknowledge: boolean;
+    defaultHospitalId: string;
+}
 export interface AppConfig {
     nodeEnv: string;
     port: number;
@@ -36,6 +44,7 @@ export interface AppConfig {
     redis: RedisConfig;
     kafka: KafkaConfig;
     defaultPacs: PacsTargetConfig;
+    hl7: Hl7MllpConfig;
 }
 declare const _default: (() => AppConfig) & import("@nestjs/config").ConfigFactoryKeyHost<AppConfig>;
 export default _default;

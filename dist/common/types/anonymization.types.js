@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.AuditEventType = exports.AnonymizationActionType = void 0;
+exports.AuditEventType = exports.SensitivityLevel = exports.AnonymizationActionType = void 0;
 var AnonymizationActionType;
 (function (AnonymizationActionType) {
     AnonymizationActionType["REMOVE"] = "remove";
@@ -11,6 +11,13 @@ var AnonymizationActionType;
     AnonymizationActionType["KEEP"] = "keep";
     AnonymizationActionType["EMPTY"] = "empty";
 })(AnonymizationActionType || (exports.AnonymizationActionType = AnonymizationActionType = {}));
+var SensitivityLevel;
+(function (SensitivityLevel) {
+    SensitivityLevel["NORMAL"] = "normal";
+    SensitivityLevel["HIGH"] = "high";
+    SensitivityLevel["VERY_HIGH"] = "very_high";
+    SensitivityLevel["MAXIMUM"] = "maximum";
+})(SensitivityLevel || (exports.SensitivityLevel = SensitivityLevel = {}));
 var AuditEventType;
 (function (AuditEventType) {
     AuditEventType["DICOM_RECEIVED"] = "dicom_received";

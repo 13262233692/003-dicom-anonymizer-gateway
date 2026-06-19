@@ -26,7 +26,8 @@
       "@anonymization/*": ["src/anonymization/*"],
       "@routing/*": ["src/routing/*"],
       "@audit/*": ["src/audit/*"],
-      "@redis/*": ["src/redis/*"]
+      "@redis/*": ["src/redis/*"],
+      "@hl7/*": ["src/hl7/*"]
     }
   }
 }
