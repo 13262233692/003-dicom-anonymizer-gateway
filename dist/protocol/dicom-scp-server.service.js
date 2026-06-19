@@ -52,6 +52,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.DicomScpServer = void 0;
 const common_1 = require("@nestjs/common");
 const net = __importStar(require("net"));
+const stream_1 = require("stream");
 const uuid_1 = require("uuid");
 const configuration_1 = __importDefault(require("../common/config/configuration"));
 const dicom_pdu_codec_service_1 = require("./dicom-pdu-codec.service");
@@ -68,9 +69,13 @@ let DicomScpServer = DicomScpServer_1 = class DicomScpServer {
         this.server = null;
         this.associations = new Map();
         this.cStoreRequestSubject = new rxjs_1.Subject();
+        this.cStoreStreamRequestSubject = new rxjs_1.Subject();
     }
     get cStoreRequests$() {
         return this.cStoreRequestSubject.asObservable();
+    }
+    get cStoreStreamRequests$() {
+        return this.cStoreStreamRequestSubject.asObservable();
     }
     onModuleInit() {
         this.startServer();
@@ -115,6 +120,10 @@ let DicomScpServer = DicomScpServer_1 = class DicomScpServer {
         let dataSetBuffer = null;
         let currentPresentationContextId = 0;
         let isCollectingDataSet = false;
+        let streamDataSet = null;
+        let streamCommand = null;
+        let streamContextId = 0;
+        let isStreaming = false;
         socket.on('data', async (data) => {
             receiveBuffer = Buffer.concat([receiveBuffer, data]);
             while (receiveBuffer.length >= 6) {
@@ -136,28 +145,69 @@ let DicomScpServer = DicomScpServer_1 = class DicomScpServer {
                             if (association) {
                                 for (const pdv of pdu.pdvItems) {
                                     if (pdv.command) {
-                                        if (pdv.last && !isCollectingDataSet) {
+                                        if (pdv.last && !isCollectingDataSet && !isStreaming) {
                                             const cmdBuf = pdv.data;
                                             await this.handleDimseCommand(socket, association, pdv.presentationContextId, cmdBuf, null);
                                             commandBuffer = null;
                                         }
                                         else {
                                             commandBuffer = commandBuffer ? Buffer.concat([commandBuffer, pdv.data]) : pdv.data;
-                                            if (pdv.last) {
-                                                isCollectingDataSet = true;
+                                            if (pdv.last && commandBuffer) {
+                                                const cmdBuf = commandBuffer;
+                                                try {
+                                                    const cmd = this.dimseCodec.decodeCommand(cmdBuf);
+                                                    if (cmd.commandField === dicom_pdu_types_1.CommandField.C_STORE_RQ) {
+                                                        isStreaming = true;
+                                                        streamCommand = cmd;
+                                                        streamContextId = pdv.presentationContextId;
+                                                        streamDataSet = new stream_1.PassThrough();
+                                                        const streamRequest = {
+                                                            association,
+                                                            presentationContextId: pdv.presentationContextId,
+                                                            command: cmd,
+                                                            dataSetStream: streamDataSet,
+                                                            messageId: cmd.messageId,
+                                                            respond: (status) => {
+                                                                this.sendCStoreResponse(socket, association, pdv.presentationContextId, cmd.messageId, status, cmd.sopClassUid || '', cmd.sopInstanceUid || '');
+                                                            },
+                                                        };
+                                                        this.cStoreStreamRequestSubject.next(streamRequest);
+                                                        this.logger.debug(`Streaming C-STORE started: SOP=${cmd.sopInstanceUid}`);
+                                                    }
+                                                    else {
+                                                        isCollectingDataSet = true;
+                                                    }
+                                                }
+                                                catch (e) {
+                                                    this.logger.error(`Error decoding command: ${e.message}`);
+                                                    isCollectingDataSet = true;
+                                                }
+                                                commandBuffer = null;
                                             }
                                         }
                                     }
                                     else {
-                                        dataSetBuffer = dataSetBuffer ? Buffer.concat([dataSetBuffer, pdv.data]) : pdv.data;
-                                        currentPresentationContextId = pdv.presentationContextId;
-                                        if (pdv.last) {
-                                            if (commandBuffer) {
-                                                await this.handleDimseCommand(socket, association, currentPresentationContextId, commandBuffer, dataSetBuffer);
+                                        if (isStreaming && streamDataSet) {
+                                            streamDataSet.write(pdv.data);
+                                            if (pdv.last) {
+                                                streamDataSet.end();
+                                                this.logger.debug(`Streaming C-STORE data set ended: SOP=${streamCommand?.sopInstanceUid}`);
+                                                streamDataSet = null;
+                                                isStreaming = false;
+                                                streamCommand = null;
                                             }
-                                            commandBuffer = null;
-                                            dataSetBuffer = null;
-                                            isCollectingDataSet = false;
+                                        }
+                                        else {
+                                            dataSetBuffer = dataSetBuffer ? Buffer.concat([dataSetBuffer, pdv.data]) : pdv.data;
+                                            currentPresentationContextId = pdv.presentationContextId;
+                                            if (pdv.last) {
+                                                if (commandBuffer) {
+                                                    await this.handleDimseCommand(socket, association, currentPresentationContextId, commandBuffer, dataSetBuffer);
+                                                }
+                                                commandBuffer = null;
+                                                dataSetBuffer = null;
+                                                isCollectingDataSet = false;
+                                            }
                                         }
                                     }
                                 }

@@ -10,13 +10,14 @@ exports.DicomModule = void 0;
 const common_1 = require("@nestjs/common");
 const dicom_binary_parser_service_1 = require("./dicom-binary-parser.service");
 const dicom_binary_reconstructor_service_1 = require("./dicom-binary-reconstructor.service");
+const streaming_anonymization_engine_service_1 = require("./streaming-anonymization-engine.service");
 let DicomModule = class DicomModule {
 };
 exports.DicomModule = DicomModule;
 exports.DicomModule = DicomModule = __decorate([
     (0, common_1.Module)({
-        providers: [dicom_binary_parser_service_1.DicomBinaryParser, dicom_binary_reconstructor_service_1.DicomBinaryReconstructor],
-        exports: [dicom_binary_parser_service_1.DicomBinaryParser, dicom_binary_reconstructor_service_1.DicomBinaryReconstructor],
+        providers: [dicom_binary_parser_service_1.DicomBinaryParser, dicom_binary_reconstructor_service_1.DicomBinaryReconstructor, streaming_anonymization_engine_service_1.StreamingAnonymizationEngine],
+        exports: [dicom_binary_parser_service_1.DicomBinaryParser, dicom_binary_reconstructor_service_1.DicomBinaryReconstructor, streaming_anonymization_engine_service_1.StreamingAnonymizationEngine],
     })
 ], DicomModule);
 //# sourceMappingURL=dicom.module.js.map

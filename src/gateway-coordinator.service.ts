@@ -1,8 +1,9 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { DicomScpServer } from '@protocol/dicom-scp-server.service';
-import { CStoreRequest } from '@protocol/dicom-pdu.types';
+import { CStoreStreamRequest, DimseStatus } from '@protocol/dicom-pdu.types';
 import { DicomBinaryParser } from '@dicom/dicom-binary-parser.service';
 import { AnonymizationEngine } from '@anonymization/anonymization-engine.service';
+import { StreamingAnonymizationEngine } from '@dicom/streaming-anonymization-engine.service';
 import { RedisRuleService } from '@redis/redis-rule.service';
 import { RoutingEngine } from '@routing/routing-engine.service';
 import { AuditLoggerService } from '@audit/audit-logger.service';
@@ -17,32 +18,46 @@ export class GatewayCoordinator implements OnModuleInit {
     private readonly dicomScpServer: DicomScpServer,
     private readonly dicomParser: DicomBinaryParser,
     private readonly anonymizationEngine: AnonymizationEngine,
+    private readonly streamingAnonymizationEngine: StreamingAnonymizationEngine,
     private readonly redisRuleService: RedisRuleService,
     private readonly routingEngine: RoutingEngine,
     private readonly auditLogger: AuditLoggerService,
   ) {}
 
   onModuleInit(): void {
-    this.logger.log('Gateway Coordinator initializing DICOM C-STORE subscription');
-    this.dicomScpServer.cStoreRequests$.subscribe({
+    this.logger.log('Gateway Coordinator initializing DICOM C-STORE streaming subscription');
+    this.dicomScpServer.cStoreStreamRequests$.subscribe({
       next: (request) => {
-        this.handleCStoreRequest(request).catch((error) => {
-          this.logger.error(`Unhandled error in C-STORE processing: ${error.message}`);
+        this.handleCStoreStreamRequest(request).catch((error) => {
+          this.logger.error(`Unhandled error in C-STORE streaming processing: ${error.message}`);
+          try {
+            request.respond(DimseStatus.PROCESSING_FAILURE);
+          } catch (_e) {
+            // ignore
+          }
         });
       },
       error: (error) => {
         this.logger.error(`C-STORE stream error: ${error.message}`);
       },
     });
+
+    const memInfo = this.streamingAnonymizationEngine.getMemoryUsageInfo();
+    this.logger.log(
+      `Streaming pipeline configured: maxTagValueInMemory=${memInfo.maxTagValueInMemory}, ` +
+        `expectedMemoryPerStream=${memInfo.expectedMemoryPerStream}`,
+    );
   }
 
-  private async handleCStoreRequest(request: CStoreRequest): Promise<void> {
+  private async handleCStoreStreamRequest(request: CStoreStreamRequest): Promise<void> {
     const traceId = uuidv4();
     const startTime = Date.now();
 
     this.logger.log(
-      `[${traceId}] C-STORE received: CallingAE=${request.association.callingAeTitle}, ` +
-        `SOPClass=${request.command.sopClassUid}, SOPInstance=${request.command.sopInstanceUid}`,
+      `[${traceId}] C-STORE streaming request received: ` +
+        `CallingAE=${request.association.callingAeTitle}, ` +
+        `SOPClass=${request.command.sopClassUid}, ` +
+        `SOPInstance=${request.command.sopInstanceUid}`,
     );
 
     await this.auditLogger.log({
@@ -55,26 +70,22 @@ export class GatewayCoordinator implements OnModuleInit {
       additionalData: {
         callingHost: request.association.callingHost,
         callingPort: request.association.callingPort,
+        processingMode: 'streaming-end-to-end',
       },
     });
 
-    let hospitalId: string = 'default';
-    let parsedDicom: any = null;
+    const hospitalId = this.resolveHospitalId(request.association.callingAeTitle);
+    let responded = false;
+
+    const respondWithStatus = (status: DimseStatus) => {
+      if (!responded) {
+        responded = true;
+        request.respond(status);
+      }
+    };
 
     try {
-      parsedDicom = this.dicomParser.parse(request.dataSet);
-
-      const institutionName = this.getTagString(parsedDicom, 0x0008, 0x0080);
-      hospitalId = this.resolveHospitalId(
-        institutionName,
-        request.association.callingAeTitle,
-      );
-
-      this.logger.debug(`[${traceId}] Resolved hospital ID: ${hospitalId}`);
-
-      const originalPatientId = this.getTagString(parsedDicom, 0x0010, 0x0020);
-      const studyInstanceUid = this.getTagString(parsedDicom, 0x0020, 0x000d);
-      const seriesInstanceUid = this.getTagString(parsedDicom, 0x0020, 0x000e);
+      this.logger.debug(`[${traceId}] Resolved hospital ID: ${hospitalId} (from AE Title)`);
 
       await this.auditLogger.log({
         eventType: AuditEventType.ANONYMIZATION_STARTED,
@@ -83,25 +94,31 @@ export class GatewayCoordinator implements OnModuleInit {
         sourceAeTitle: request.association.callingAeTitle,
         sopClassUid: request.command.sopClassUid,
         sopInstanceUid: request.command.sopInstanceUid,
-        patientId: originalPatientId,
-        studyInstanceUid,
-        seriesInstanceUid,
         status: 'processing',
+        additionalData: {
+          processingMode: 'streaming-end-to-end',
+        },
       });
 
       const anonymizationRule = await this.redisRuleService.getAnonymizationRule(hospitalId);
 
-      const processingResult = await this.anonymizationEngine.process(
-        request.dataSet,
+      const {
+        stream: anonymizationStream,
+        resultPromise: streamResultPromise,
+      } = this.streamingAnonymizationEngine.createAnonymizationStream(
         anonymizationRule,
         hospitalId,
         request.association.callingAeTitle,
       );
 
-      const anonymizedPatientId = this.getTagString(
-        this.dicomParser.parse(processingResult.anonymizedBuffer),
-        0x0010,
-        0x0020,
+      request.dataSetStream.pipe(anonymizationStream);
+
+      const streamResult = await streamResultPromise;
+
+      this.logger.debug(
+        `[${traceId}] Stream metadata ready: modified=${streamResult.modifiedTags.length}, ` +
+          `removed=${streamResult.removedTags.length}, ` +
+          `pixelData=${(streamResult.pixelDataBytesProcessed / 1024 / 1024).toFixed(2)}MB`,
       );
 
       await this.auditLogger.log({
@@ -110,23 +127,27 @@ export class GatewayCoordinator implements OnModuleInit {
         hospitalId,
         sourceAeTitle: request.association.callingAeTitle,
         sopClassUid: request.command.sopClassUid,
-        sopInstanceUid: processingResult.anonymizedSopInstanceUid,
-        patientId: originalPatientId,
-        anonymizedPatientId,
-        studyInstanceUid,
-        seriesInstanceUid,
+        sopInstanceUid: streamResult.anonymizedSopInstanceUid,
+        patientId: streamResult.originalPatientId,
+        anonymizedPatientId: streamResult.anonymizedPatientId,
+        studyInstanceUid: streamResult.studyInstanceUid,
+        seriesInstanceUid: streamResult.seriesInstanceUid,
         ruleId: anonymizationRule.id,
         ruleApplied: anonymizationRule.ruleName,
-        tagsModified: processingResult.modifiedTags,
-        tagsRemoved: processingResult.removedTags,
-        durationMs: processingResult.processingDurationMs,
+        tagsModified: streamResult.modifiedTags,
+        tagsRemoved: streamResult.removedTags,
+        durationMs: Date.now() - startTime,
         status: 'success',
+        additionalData: {
+          processingMode: 'streaming-end-to-end',
+          pixelDataBytesProcessed: streamResult.pixelDataBytesProcessed,
+          totalTagsProcessed: streamResult.totalTagsProcessed,
+        },
       });
 
-      const modality = this.getTagString(parsedDicom, 0x0008, 0x0060);
       const routingTarget = await this.routingEngine.resolveTarget(
         hospitalId,
-        modality || undefined,
+        streamResult.modality || undefined,
         request.association.callingAeTitle,
       );
 
@@ -150,60 +171,70 @@ export class GatewayCoordinator implements OnModuleInit {
         hospitalId,
         destinationAeTitle: routingTarget.aeTitle,
         sopClassUid: request.command.sopClassUid,
-        sopInstanceUid: processingResult.anonymizedSopInstanceUid,
+        sopInstanceUid: streamResult.anonymizedSopInstanceUid,
         routingTargetId: routingTarget.id,
         status: 'processing',
       });
 
-      processingResult.routingTarget = routingTarget;
-
-      const transferResult = await this.routingEngine.forwardToPacs(
-        processingResult,
+      const transferResult = await this.routingEngine.forwardStreamToPacs(
+        anonymizationStream,
+        streamResult,
         routingTarget,
         request.association.calledAeTitle,
+        hospitalId,
+        traceId,
       );
 
       const totalDuration = Date.now() - startTime;
 
       if (transferResult.success) {
+        respondWithStatus(DimseStatus.SUCCESS);
+
         await this.auditLogger.log({
           eventType: AuditEventType.PACS_TRANSFER_COMPLETED,
           traceId,
           hospitalId,
           destinationAeTitle: routingTarget.aeTitle,
           sopClassUid: request.command.sopClassUid,
-          sopInstanceUid: processingResult.anonymizedSopInstanceUid,
-          anonymizedPatientId,
-          studyInstanceUid,
-          seriesInstanceUid,
+          sopInstanceUid: streamResult.anonymizedSopInstanceUid,
+          anonymizedPatientId: streamResult.anonymizedPatientId,
+          studyInstanceUid: streamResult.studyInstanceUid,
+          seriesInstanceUid: streamResult.seriesInstanceUid,
           routingTargetId: routingTarget.id,
           durationMs: transferResult.durationMs,
           status: 'success',
           additionalData: {
             totalDurationMs: totalDuration,
             dicomStatus: transferResult.status,
+            processingMode: 'streaming-end-to-end',
+            pixelDataBytes: streamResult.pixelDataBytesProcessed,
           },
         });
 
         this.logger.log(
-          `[${traceId}] Processing pipeline completed successfully. ` +
-            `Total duration: ${totalDuration}ms, Anonymization: ${processingResult.processingDurationMs}ms, ` +
-            `Transfer: ${transferResult.durationMs}ms`,
+          `[${traceId}] End-to-end streaming pipeline completed successfully. ` +
+            `Total duration: ${totalDuration}ms, ` +
+            `Pixel data: ${(streamResult.pixelDataBytesProcessed / 1024 / 1024).toFixed(2)}MB, ` +
+            `Tags modified: ${streamResult.modifiedTags.length}, ` +
+            `Tags removed: ${streamResult.removedTags.length}`,
         );
       } else {
+        respondWithStatus(transferResult.status);
+
         await this.auditLogger.log({
           eventType: AuditEventType.PACS_TRANSFER_FAILED,
           traceId,
           hospitalId,
           destinationAeTitle: routingTarget.aeTitle,
           sopClassUid: request.command.sopClassUid,
-          sopInstanceUid: processingResult.anonymizedSopInstanceUid,
+          sopInstanceUid: streamResult.anonymizedSopInstanceUid,
           routingTargetId: routingTarget.id,
           durationMs: transferResult.durationMs,
           status: 'failed',
           errorMessage: `PACS C-STORE failed with status: 0x${transferResult.status.toString(16)}`,
           additionalData: {
             totalDurationMs: totalDuration,
+            processingMode: 'streaming-end-to-end',
           },
         });
 
@@ -214,9 +245,10 @@ export class GatewayCoordinator implements OnModuleInit {
       }
     } catch (error) {
       const totalDuration = Date.now() - startTime;
+      respondWithStatus(DimseStatus.PROCESSING_FAILURE);
 
       this.logger.error(
-        `[${traceId}] Processing pipeline failed after ${totalDuration}ms: ${error.message}`,
+        `[${traceId}] Streaming processing pipeline failed after ${totalDuration}ms: ${error.message}`,
       );
       this.logger.debug(`[${traceId}] Error stack: ${error.stack}`);
 
@@ -233,37 +265,16 @@ export class GatewayCoordinator implements OnModuleInit {
         errorStack: error.stack,
         additionalData: {
           errorType: error.constructor.name,
+          processingMode: 'streaming-end-to-end',
         },
       });
     }
   }
 
-  private resolveHospitalId(institutionName: string, callingAeTitle: string): string {
-    if (institutionName && institutionName.trim()) {
-      const normalized = institutionName.trim().toLowerCase().replace(/[^a-z0-9]/g, '_');
-      if (normalized.length > 0) {
-        return normalized;
-      }
-    }
-
+  private resolveHospitalId(callingAeTitle: string): string {
     if (callingAeTitle) {
       return callingAeTitle.trim().toLowerCase();
     }
-
     return 'default';
-  }
-
-  private getTagString(parsed: any, group: number, element: number): string {
-    const key = `(${group.toString(16).padStart(4, '0').toUpperCase()},${element.toString(16).padStart(4, '0').toUpperCase()})`;
-    const tag = parsed.tags.get(key);
-    if (!tag) return '';
-
-    if (typeof tag.value === 'string') {
-      return tag.value.trim().replace(/\0/g, '');
-    }
-    if (Buffer.isBuffer(tag.value)) {
-      return tag.value.toString('utf8').trim().replace(/\0/g, '');
-    }
-    return String(tag.value || '');
   }
 }

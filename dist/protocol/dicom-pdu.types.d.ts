@@ -1,3 +1,4 @@
+import { Readable } from 'stream';
 export declare enum PduType {
     A_ASSOCIATE_RQ = 1,
     A_ASSOCIATE_AC = 2,
@@ -115,6 +116,14 @@ export interface CStoreRequest {
     presentationContextId: number;
     command: DimseCommand;
     dataSet: Buffer;
+}
+export interface CStoreStreamRequest {
+    association: DicomAssociation;
+    presentationContextId: number;
+    command: DimseCommand;
+    dataSetStream: Readable;
+    messageId: number;
+    respond: (status: DimseStatus) => void;
 }
 export interface CStoreResponse {
     status: DimseStatus;

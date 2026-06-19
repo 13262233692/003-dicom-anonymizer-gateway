@@ -1,6 +1,7 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
 import { ConfigType } from '@nestjs/config';
 import * as net from 'net';
+import { Readable } from 'stream';
 import configuration from '@common/config/configuration';
 import { DicomPduCodec } from './dicom-pdu-codec.service';
 import { DimseCodec } from './dimse-codec.service';
@@ -9,6 +10,8 @@ import {
   PresentationContext,
   DimseStatus,
   CommandField,
+  PresentationDataValueItem,
+  PDataTfPDU,
 } from './dicom-pdu.types';
 import { DicomTagVR } from '@common/types/dicom.types';
 import { DicomNetworkException } from '@common/exceptions/custom.exceptions';
@@ -122,6 +125,223 @@ export class DicomScuClient {
                         storeCompleted = true;
                         this.logger.log(
                           `[${traceId}] C-STORE completed with status: 0x${response.status.toString(16)}`,
+                        );
+                        this.sendReleaseRq(socket);
+                        clearTimeout(timer);
+                        resolve(response.status);
+                      }
+                    } catch (e) {
+                      this.logger.error(`[${traceId}] Error parsing response: ${e.message}`);
+                    }
+                  }
+                }
+                break;
+              }
+
+              case PduType.A_RELEASE_RP:
+                this.logger.debug(`[${traceId}] Release confirmed`);
+                clearTimeout(timer);
+                cleanup();
+                if (!storeCompleted) {
+                  resolve(DimseStatus.SUCCESS);
+                }
+                return;
+
+              case PduType.A_ABORT:
+                clearTimeout(timer);
+                cleanup();
+                reject(new DicomNetworkException('Association aborted', targetAeTitle));
+                return;
+
+              default:
+                break;
+            }
+          } catch (error) {
+            this.logger.error(`[${traceId}] PDU decode error: ${error.message}`);
+          }
+        }
+      });
+
+      socket.on('error', (error) => {
+        clearTimeout(timer);
+        cleanup();
+        reject(new DicomNetworkException(`Socket error: ${error.message}`, targetAeTitle, error));
+      });
+
+      socket.on('close', () => {
+        clearTimeout(timer);
+        if (!storeCompleted) {
+          reject(new DicomNetworkException('Connection closed before C-STORE completed', targetAeTitle));
+        }
+      });
+
+      socket.connect(targetPort, targetHost);
+    });
+  }
+
+  public async cStoreStream(
+    targetHost: string,
+    targetPort: number,
+    targetAeTitle: string,
+    sourceAeTitle: string,
+    sopClassUid: string,
+    sopInstanceUid: string,
+    dataSetStream: Readable,
+    context?: PacsTransferContext,
+  ): Promise<DimseStatus> {
+    const traceId = context?.studyInstanceUid || sopInstanceUid;
+    this.logger.log(
+      `[${traceId}] Initiating streaming C-STORE to ${targetAeTitle}@${targetHost}:${targetPort} for SOP=${sopInstanceUid}`,
+    );
+
+    return new Promise((resolve, reject) => {
+      const socket = new net.Socket();
+      const timeout = this.config.dicomScp.requestTimeout;
+
+      const cleanup = () => {
+        try {
+          dataSetStream.destroy();
+        } catch (_e) {
+          // ignore
+        }
+        try {
+          socket.destroy();
+        } catch (_e) {
+          // ignore
+        }
+      };
+
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new DicomNetworkException('C-STORE timeout', targetAeTitle));
+      }, timeout);
+
+      let associationEstablished = false;
+      let receiveBuffer = Buffer.alloc(0);
+      let storeCompleted = false;
+      let currentContextId = 0;
+      let maxPduLength = 16384;
+      let dataSetStarted = false;
+      let dataSetFinished = false;
+
+      const startStreaming = () => {
+        if (dataSetStarted) return;
+        dataSetStarted = true;
+
+        this.logger.debug(`[${traceId}] Starting data set streaming`);
+
+        let pendingBuffer = Buffer.alloc(0);
+        const chunkSize = Math.min(maxPduLength - 12, 16000);
+
+        const sendDataPdu = (data: Buffer, isLast: boolean) => {
+          const pdvItem: PresentationDataValueItem = {
+            presentationContextId: currentContextId,
+            command: false,
+            last: isLast,
+            data,
+          };
+          const pduBuf = this.pduCodec.encode({
+            type: PduType.P_DATA_TF,
+            pdvItems: [pdvItem],
+          } as PDataTfPDU);
+          socket.write(pduBuf);
+        };
+
+        const flushBuffer = (isLast: boolean) => {
+          while (pendingBuffer.length > 0) {
+            const toSend = pendingBuffer.slice(0, chunkSize);
+            pendingBuffer = pendingBuffer.slice(toSend.length);
+            const isLastChunk = isLast && pendingBuffer.length === 0;
+            sendDataPdu(toSend, isLastChunk);
+          }
+          if (isLast && pendingBuffer.length === 0) {
+            sendDataPdu(Buffer.alloc(0), true);
+          }
+        };
+
+        dataSetStream.on('data', (chunk: Buffer) => {
+          pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
+          if (pendingBuffer.length >= chunkSize) {
+            flushBuffer(false);
+          }
+        });
+
+        dataSetStream.on('end', () => {
+          this.logger.debug(`[${traceId}] Data set stream ended`);
+          dataSetFinished = true;
+          flushBuffer(true);
+        });
+
+        dataSetStream.on('error', (error) => {
+          this.logger.error(`[${traceId}] Data set stream error: ${error.message}`);
+          clearTimeout(timer);
+          cleanup();
+          reject(error);
+        });
+      };
+
+      socket.on('connect', () => {
+        this.logger.debug(`[${traceId}] TCP connected to ${targetHost}:${targetPort}`);
+        this.sendAssociateRq(socket, sourceAeTitle, targetAeTitle, sopClassUid);
+      });
+
+      socket.on('data', (data) => {
+        receiveBuffer = Buffer.concat([receiveBuffer, data]);
+
+        while (receiveBuffer.length >= 6) {
+          const pduType = receiveBuffer.readUInt8(0);
+          const pduLength = receiveBuffer.readUInt32BE(2);
+          const totalSize = 6 + pduLength;
+
+          if (receiveBuffer.length < totalSize) break;
+
+          const pduData = Buffer.from(receiveBuffer.subarray(0, totalSize));
+          receiveBuffer = Buffer.from(receiveBuffer.subarray(totalSize));
+
+          try {
+            const pdu = this.pduCodec.decode(pduData);
+
+            switch (pdu.type) {
+              case PduType.A_ASSOCIATE_AC:
+                this.logger.debug(`[${traceId}] Association accepted`);
+                associationEstablished = true;
+                const acPdu = pdu as any;
+                const acceptedCtx = (acPdu.presentationContexts || []).find(
+                  (c: PresentationContext) => c.result === 0,
+                );
+                if (acceptedCtx) {
+                  currentContextId = acceptedCtx.id;
+                } else {
+                  currentContextId = 1;
+                }
+                maxPduLength = acPdu.maxLength || 16384;
+
+                this.sendCStoreCommandOnly(
+                  socket,
+                  currentContextId,
+                  sopClassUid,
+                  sopInstanceUid,
+                );
+
+                startStreaming();
+                break;
+
+              case PduType.A_ASSOCIATE_RJ:
+                clearTimeout(timer);
+                cleanup();
+                reject(new DicomNetworkException('Association rejected', targetAeTitle));
+                return;
+
+              case PduType.P_DATA_TF: {
+                const pdvItems = (pdu as any).pdvItems || [];
+                for (const pdv of pdvItems) {
+                  if (pdv.command && pdv.last && !storeCompleted) {
+                    try {
+                      const response = this.dimseCodec.decodeCommand(pdv.data);
+                      if (response.commandField === CommandField.C_STORE_RSP) {
+                        storeCompleted = true;
+                        this.logger.log(
+                          `[${traceId}] Streaming C-STORE completed with status: 0x${response.status.toString(16)}`,
                         );
                         this.sendReleaseRq(socket);
                         clearTimeout(timer);
@@ -319,6 +539,45 @@ export class DicomScuClient {
     for (const chunk of pduChunks) {
       socket.write(chunk);
     }
+  }
+
+  private sendCStoreCommandOnly(
+    socket: net.Socket,
+    presentationContextId: number,
+    sopClassUid: string,
+    sopInstanceUid: string,
+  ): void {
+    const messageId = 1;
+
+    const chunks: Buffer[] = [];
+
+    chunks.push(this.encodeTag(0x0000, 0x0000, DicomTagVR.UL, 0));
+    chunks.push(this.encodeTag(0x0000, 0x0002, DicomTagVR.UI, '1.2.840.10008.1.2'));
+    chunks.push(this.encodeTag(0x0000, 0x0100, DicomTagVR.US, CommandField.C_STORE_RQ));
+    chunks.push(this.encodeTag(0x0000, 0x0110, DicomTagVR.US, messageId));
+    chunks.push(this.encodeTag(0x0000, 0x0700, DicomTagVR.US, 0));
+    chunks.push(this.encodeTag(0x0000, 0x0800, DicomTagVR.US, 0x0000));
+    chunks.push(this.encodeTag(0x0000, 0x0002, DicomTagVR.UI, sopClassUid));
+    chunks.push(this.encodeTag(0x0000, 0x1000, DicomTagVR.UI, sopInstanceUid));
+    chunks.push(this.encodeTag(0x0000, 0x0010, DicomTagVR.US, 0));
+
+    const commandBuf = Buffer.concat(chunks);
+    const totalLength = commandBuf.length - 8;
+    commandBuf.writeUInt32LE(totalLength, 4);
+
+    const pdvItem: PresentationDataValueItem = {
+      presentationContextId,
+      command: true,
+      last: false,
+      data: commandBuf,
+    };
+
+    const pduBuf = this.pduCodec.encode({
+      type: PduType.P_DATA_TF,
+      pdvItems: [pdvItem],
+    } as PDataTfPDU);
+
+    socket.write(pduBuf);
   }
 
   private sendReleaseRq(socket: net.Socket): void {

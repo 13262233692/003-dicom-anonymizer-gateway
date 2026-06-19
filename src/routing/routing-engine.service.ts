@@ -1,5 +1,6 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
 import { ConfigType } from '@nestjs/config';
+import { Readable } from 'stream';
 import configuration from '@common/config/configuration';
 import { RedisRuleService } from '@redis/redis-rule.service';
 import { DicomScuClient } from '@protocol/dicom-scu-client.service';
@@ -11,6 +12,7 @@ import {
 } from '@common/types/anonymization.types';
 import { RoutingTargetNotFoundException } from '@common/exceptions/custom.exceptions';
 import { DimseStatus } from '@protocol/dicom-pdu.types';
+import { AnonymizationStreamResult } from '@dicom/dicom-anonymization-stream';
 
 @Injectable()
 export class RoutingEngine {
@@ -126,6 +128,81 @@ export class RoutingEngine {
       const durationMs = Date.now() - startTime;
       this.logger.error(
         `[${traceId}] C-STORE to PACS failed after ${durationMs}ms: ${error.message}`,
+      );
+
+      return {
+        success: false,
+        status: DimseStatus.PROCESSING_FAILURE,
+        durationMs,
+        transferContext,
+      };
+    }
+  }
+
+  public async forwardStreamToPacs(
+    dataSetStream: Readable,
+    streamResult: AnonymizationStreamResult,
+    target: RoutingTarget,
+    sourceAeTitle: string,
+    hospitalId: string,
+    traceId: string,
+  ): Promise<{
+    success: boolean;
+    status: DimseStatus;
+    durationMs: number;
+    transferContext: PacsTransferContext;
+  }> {
+    const startTime = Date.now();
+
+    this.logger.log(
+      `[${traceId}] Forwarding stream to PACS ${target.aeTitle}@${target.host}:${target.port}`,
+    );
+
+    const transferContext: PacsTransferContext = {
+      sourceAeTitle,
+      sourceHost: '0.0.0.0',
+      sourcePort: this.config.dicomScp.port,
+      destinationAeTitle: target.aeTitle,
+      destinationHost: target.host,
+      destinationPort: target.port,
+      sopClassUid: streamResult.sopClassUid,
+      sopInstanceUid: streamResult.anonymizedSopInstanceUid,
+      patientId: streamResult.anonymizedPatientId || streamResult.originalPatientId,
+      studyInstanceUid: streamResult.studyInstanceUid,
+      seriesInstanceUid: streamResult.seriesInstanceUid,
+      hospitalId,
+      modality: streamResult.modality,
+    };
+
+    try {
+      const status = await this.dicomScuClient.cStoreStream(
+        target.host,
+        target.port,
+        target.aeTitle,
+        sourceAeTitle,
+        streamResult.sopClassUid,
+        streamResult.anonymizedSopInstanceUid,
+        dataSetStream,
+        transferContext,
+      );
+
+      const durationMs = Date.now() - startTime;
+      const success = status === DimseStatus.SUCCESS || status === DimseStatus.WARNING;
+
+      this.logger.log(
+        `[${traceId}] Streaming C-STORE to PACS completed: status=0x${status.toString(16)}, duration=${durationMs}ms, success=${success}`,
+      );
+
+      return {
+        success,
+        status,
+        durationMs,
+        transferContext,
+      };
+    } catch (error) {
+      const durationMs = Date.now() - startTime;
+      this.logger.error(
+        `[${traceId}] Streaming C-STORE to PACS failed after ${durationMs}ms: ${error.message}`,
       );
 
       return {

@@ -94,6 +94,47 @@ let RoutingEngine = RoutingEngine_1 = class RoutingEngine {
             };
         }
     }
+    async forwardStreamToPacs(dataSetStream, streamResult, target, sourceAeTitle, hospitalId, traceId) {
+        const startTime = Date.now();
+        this.logger.log(`[${traceId}] Forwarding stream to PACS ${target.aeTitle}@${target.host}:${target.port}`);
+        const transferContext = {
+            sourceAeTitle,
+            sourceHost: '0.0.0.0',
+            sourcePort: this.config.dicomScp.port,
+            destinationAeTitle: target.aeTitle,
+            destinationHost: target.host,
+            destinationPort: target.port,
+            sopClassUid: streamResult.sopClassUid,
+            sopInstanceUid: streamResult.anonymizedSopInstanceUid,
+            patientId: streamResult.anonymizedPatientId || streamResult.originalPatientId,
+            studyInstanceUid: streamResult.studyInstanceUid,
+            seriesInstanceUid: streamResult.seriesInstanceUid,
+            hospitalId,
+            modality: streamResult.modality,
+        };
+        try {
+            const status = await this.dicomScuClient.cStoreStream(target.host, target.port, target.aeTitle, sourceAeTitle, streamResult.sopClassUid, streamResult.anonymizedSopInstanceUid, dataSetStream, transferContext);
+            const durationMs = Date.now() - startTime;
+            const success = status === dicom_pdu_types_1.DimseStatus.SUCCESS || status === dicom_pdu_types_1.DimseStatus.WARNING;
+            this.logger.log(`[${traceId}] Streaming C-STORE to PACS completed: status=0x${status.toString(16)}, duration=${durationMs}ms, success=${success}`);
+            return {
+                success,
+                status,
+                durationMs,
+                transferContext,
+            };
+        }
+        catch (error) {
+            const durationMs = Date.now() - startTime;
+            this.logger.error(`[${traceId}] Streaming C-STORE to PACS failed after ${durationMs}ms: ${error.message}`);
+            return {
+                success: false,
+                status: dicom_pdu_types_1.DimseStatus.PROCESSING_FAILURE,
+                durationMs,
+                transferContext,
+            };
+        }
+    }
     extractTagValue(parsed, group, element) {
         const key = `(${group.toString(16).padStart(4, '0').toUpperCase()},${element.toString(16).padStart(4, '0').toUpperCase()})`;
         const tag = parsed.tags.get(key);

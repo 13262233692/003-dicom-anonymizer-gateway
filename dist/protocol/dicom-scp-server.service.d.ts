@@ -3,7 +3,7 @@ import { ConfigType } from '@nestjs/config';
 import configuration from '@common/config/configuration';
 import { DicomPduCodec } from './dicom-pdu-codec.service';
 import { DimseCodec } from './dimse-codec.service';
-import { DicomAssociation, CStoreRequest } from './dicom-pdu.types';
+import { DicomAssociation, CStoreRequest, CStoreStreamRequest } from './dicom-pdu.types';
 import { Observable } from 'rxjs';
 export declare class DicomScpServer implements OnModuleInit, OnModuleDestroy {
     private readonly config;
@@ -13,8 +13,10 @@ export declare class DicomScpServer implements OnModuleInit, OnModuleDestroy {
     private server;
     private readonly associations;
     private readonly cStoreRequestSubject;
+    private readonly cStoreStreamRequestSubject;
     constructor(config: ConfigType<typeof configuration>, pduCodec: DicomPduCodec, dimseCodec: DimseCodec);
     get cStoreRequests$(): Observable<CStoreRequest>;
+    get cStoreStreamRequests$(): Observable<CStoreStreamRequest>;
     onModuleInit(): void;
     onModuleDestroy(): void;
     private startServer;
